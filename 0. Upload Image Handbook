@@ -1,0 +1,316 @@
+# Загрузка изображений: Streamlit → FastAPI
+
+## Что создаём
+
+Frontend отправляет изображение в FastAPI.
+
+Backend:
+
+1. создаёт уникальное имя файла;
+2. сохраняет файл в `app/media/items`;
+3. возвращает путь и URL.
+
+```text
+Streamlit
+    ↓ POST /images/upload
+FastAPI
+    ↓
+app/media/items/<filename>
+```
+
+В базе данных хранится только путь к файлу.
+
+---
+
+# Важно: два запроса при создании сущности
+
+На странице создания **нужно делать два запроса**:
+
+1. **Создание основной сущности (без изображения)**
+2. **Отдельный запрос на загрузку изображения и привязку к сущности**
+
+Почему так:
+
+* файл загружается отдельно
+* backend сначала создаёт сущность
+* затем изображение привязывается к уже существующей записи
+
+Схема:
+
+```text
+1. POST /items
+   → создаём сущность (без photo_path)
+   → получаем item_id
+
+2. POST /images/upload
+   → загружаем файл
+   → получаем photo_path
+
+3. PATCH /items/{id}
+   → передаём photo_path
+   → привязываем изображение
+```
+
+Важно:
+
+* `session_state` **не нужен**, всё происходит на одной странице
+* данные можно хранить в обычных переменных внутри одного действия
+
+---
+
+# Структура проекта
+
+```text
+app
+├── handlers
+│   └── images.py
+├── schemas
+│   └── image.py
+├── media
+│   └── items
+└── main.py
+
+frontend
+├── api
+│   └── client.py
+└── pages
+    └── create_item.py
+```
+
+---
+
+# Backend
+
+## `app/schemas/image.py`
+
+```python
+from pydantic import BaseModel
+
+
+class ImageUploadResponse(BaseModel):
+    filename: str
+    photo_path: str
+    image_url: str
+```
+
+---
+
+## `app/handlers/images.py`
+
+Минимальная версия без лишних проверок:
+
+```python
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, File, Request, UploadFile, status
+
+from app.schemas.image import ImageUploadResponse
+
+
+router = APIRouter(
+    prefix="/images",
+    tags=["images"],
+)
+
+MEDIA_DIR = Path(__file__).resolve().parent.parent / "media"
+ITEM_IMAGES_DIR = MEDIA_DIR / "items"
+
+ITEM_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@router.post(
+    "/upload",
+    response_model=ImageUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+) -> ImageUploadResponse:
+    extension = Path(file.filename or "").suffix
+
+    content = await file.read()
+    await file.close()
+
+    filename = f"{uuid4()}{extension}"
+    image_path = ITEM_IMAGES_DIR / filename
+
+    image_path.write_bytes(content)
+
+    photo_path = f"/media/items/{filename}"
+
+    image_url = request.url_for(
+        "media",
+        path=f"items/{filename}",
+    )
+
+    return ImageUploadResponse(
+        filename=filename,
+        photo_path=photo_path,
+        image_url=str(image_url),
+    )
+```
+
+Что важно адаптировать под архитектуру:
+
+* путь к `media` должен совпадать с `main.py`
+* директория (`items`) должна совпадать везде
+* возвращаемый `photo_path` используется в БД
+
+---
+
+## `app/main.py`
+
+```python
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from app.handlers import images
+
+
+app = FastAPI()
+
+MEDIA_DIR = Path(__file__).resolve().parent / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount(
+    "/media",
+    StaticFiles(directory=MEDIA_DIR),
+    name="media",
+)
+
+app.include_router(images.router)
+```
+
+Важно:
+
+* `MEDIA_DIR` должен совпадать с путём в handler
+* `app.mount("/media", ...)` обязателен для доступа к файлам
+
+---
+
+# Frontend
+
+## `frontend/api/client.py`
+
+```python
+from typing import Any
+
+import requests
+
+
+BACKEND_URL = "http://127.0.0.1:8000"
+
+
+def upload_image(uploaded_file: Any) -> dict:
+    files = {
+        "file": (
+            uploaded_file.name,
+            uploaded_file.getvalue(),
+            uploaded_file.type,
+        )
+    }
+
+    response = requests.post(
+        f"{BACKEND_URL}/images/upload",
+        files=files,
+    )
+
+    return response.json()
+```
+
+---
+
+## `frontend/pages/create_item.py`
+
+Пример с двумя запросами:
+
+```python
+import streamlit as st
+import requests
+
+from frontend.api.client import BACKEND_URL, upload_image
+
+
+st.title("Создание сущности")
+
+name = st.text_input("Название")
+description = st.text_area("Описание")
+
+uploaded_file = st.file_uploader("Изображение")
+
+if uploaded_file is not None:
+    st.image(uploaded_file)
+
+if st.button("Создать"):
+    # 1. создаём сущность без изображения
+    create_response = requests.post(
+        f"{BACKEND_URL}/items",
+        json={
+            "name": name,
+            "description": description,
+        },
+    )
+
+    item = create_response.json()
+    item_id = item["id"]
+
+    # 2. загружаем изображение
+    image_data = upload_image(uploaded_file)
+
+    # 3. привязываем изображение к сущности
+    requests.patch(
+        f"{BACKEND_URL}/items/{item_id}",
+        json={
+            "photo_path": image_data["photo_path"],
+        },
+    )
+
+    st.success("Сущность создана")
+
+    st.image(image_data["image_url"])
+```
+
+Важно:
+
+* сначала создаётся сущность
+* затем загружается файл
+* затем выполняется PATCH с `photo_path`
+* `session_state` не используется
+
+---
+
+# Отображение изображения
+
+```python
+from frontend.api.client import BACKEND_URL
+
+image_url = f"{BACKEND_URL}{item['photo_path']}"
+```
+
+---
+
+# Подсказки
+
+* храните в БД только `photo_path`, не полный URL
+* директория (`items`) должна совпадать:
+
+  * в handler
+  * в `photo_path`
+  * в `url_for`
+* используйте `uuid4()` чтобы избежать конфликтов имён
+* отправляйте файл только по кнопке (иначе Streamlit будет дублировать запросы)
+* используйте два запроса: создание сущности и отдельная привязка изображения
+
+---
+
+# Результат
+
+* есть ручка `POST /images/upload`
+* файл сохраняется в `app/media/items`
+* сущность создаётся отдельно
+* изображение привязывается через второй запрос
+* в БД хранится только `photo_path`
