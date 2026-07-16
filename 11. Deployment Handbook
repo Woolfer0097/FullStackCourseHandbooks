@@ -1,0 +1,783 @@
+# Подготовка Asticle к деплою: Streamlit Community Cloud + Cloudflare Tunnel
+
+Это руководство описывает схему, в которой:
+
+- Streamlit-фронтенд деплоится в Streamlit Community Cloud.
+- FastAPI-бэкенд запускается локально на вашей машине или сервере.
+- Cloudflare Tunnel публикует локальный FastAPI-бэкенд в интернет через HTTPS.
+- Streamlit обращается к бэкенду по публичному URL туннеля.
+
+Текущая структура проекта:
+
+```text
+Asticle/
+├── app/
+│   └── main.py                    # FastAPI app: app.main:app
+├── frontend/
+│   ├── app.py                     # Streamlit entrypoint
+│   ├── config.py                  # читает BACKEND_URL / ASTICLE_API_URL
+│   └── .streamlit/config.toml     # настройки Streamlit
+├── media/                         # локальные файлы, которые отдаёт FastAPI
+├── requirements.txt               # Python-зависимости для pip и Streamlit Cloud
+├── pyproject.toml                 # метаданные проекта
+└── README.md
+```
+
+## 1. Итоговая архитектура
+
+После деплоя запросы идут так:
+
+```text
+Браузер пользователя
+        |
+        v
+https://your-app.streamlit.app
+        |
+        v
+Streamlit Community Cloud
+        |
+        v
+https://api.example.com
+        |
+        v
+Cloudflare Tunnel
+        |
+        v
+локальный FastAPI: http://127.0.0.1:8000
+        |
+        v
+локальная SQLite DB + media/
+```
+
+Streamlit Community Cloud запускает только `frontend/app.py`. Бэкенд `app.main:app` остаётся локальным, поэтому машина с FastAPI и `cloudflared` должна быть включена, подключена к интернету и держать оба процесса запущенными.
+
+## 2. Зависимости проекта
+
+Для деплоя через Streamlit Community Cloud используем обычный `requirements.txt`.
+
+Минимальное содержимое `requirements.txt` для текущего проекта:
+
+```text
+bcrypt>=3.2.0,<4
+fastapi>=0.139.0
+jwt>=1.4.0
+passlib[bcrypt]>=1.7.4
+pydantic>=2.13.4
+pydantic-settings>=2.14.2
+pyjwt>=2.13.0
+python-multipart>=0.0.21
+requests>=2.34.2
+sqlalchemy>=2.0.51
+streamlit>=1.59.2
+streamlit-cookies-controller>=0.0.4
+uvicorn>=0.51.0
+```
+
+В `frontend/config.py` уже есть нужная логика:
+
+- сначала читать `BACKEND_URL` или `ASTICLE_API_URL` из переменных окружения;
+- затем читать эти же значения из `st.secrets`;
+- если ничего не задано, использовать `http://127.0.0.1:8000`.
+
+Поэтому на Streamlit Cloud достаточно задать secret:
+
+```toml
+BACKEND_URL = "https://api.example.com"
+```
+
+### 2.1. Какие переменные куда прокидываются
+
+Для Streamlit Cloud используем `secrets.toml` в настройках приложения:
+
+```toml
+BACKEND_URL = "https://api.example.com"
+```
+
+Локально для Streamlit можно создать `frontend/.streamlit/secrets.toml` с таким же содержимым, но этот файл не нужно коммитить.
+
+Для локального FastAPI используем `.env` в корне проекта:
+
+```env
+CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501,https://your-app.streamlit.app
+```
+
+Streamlit secrets нужны фронтенду, чтобы знать публичный URL API. Переменная `CORS_ORIGINS` нужна бэкенду, чтобы разрешить запросы с домена Streamlit Cloud.
+
+### 2.2. Конфиг Streamlit-интерфейса
+
+Файл `frontend/.streamlit/config.toml` отвечает за настройки Streamlit-интерфейса:
+
+```toml
+[client]
+showSidebarNavigation = true
+
+[theme]
+primaryColor = "#2563EB"
+```
+
+Этот файл можно коммитить. В нём нет секретов.
+
+### 2.3. Код фронтенда, который читает `BACKEND_URL`
+
+Файл `frontend/config.py`:
+
+```python
+import os
+from collections.abc import Mapping
+
+import streamlit as st
+
+
+BACKEND_SETTING_NAMES = ("BACKEND_URL", "ASTICLE_API_URL")
+SECRET_SECTIONS = ("general", "api", "backend")
+
+
+def normalize_url(value: object) -> str:
+    return str(value).strip().rstrip("/")
+
+
+def get_secret(name: str) -> object | None:
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return value
+
+        for section_name in SECRET_SECTIONS:
+            section = st.secrets.get(section_name)
+            if isinstance(section, Mapping):
+                value = section.get(name)
+                if value:
+                    return value
+    except Exception:
+        return None
+
+    return None
+
+
+def get_setting(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return normalize_url(value)
+
+    for name in names:
+        value = get_secret(name)
+        if value:
+            return normalize_url(value)
+
+    return normalize_url(default)
+
+
+def get_backend_url() -> str:
+    return get_setting(BACKEND_SETTING_NAMES, "http://127.0.0.1:8000")
+
+
+BACKEND_URL = get_backend_url()
+REQUEST_TIMEOUT = 8
+```
+
+Логика такая:
+
+- локально можно прокинуть `BACKEND_URL` через переменную окружения;
+- в Streamlit Cloud значение берётся из `st.secrets`;
+- если ничего не задано, используется локальный адрес `http://127.0.0.1:8000`.
+
+### 2.4. Код фронтенда, который использует URL бэкенда
+
+Файл `frontend/api/client.py`:
+
+```python
+from typing import Any
+
+import requests
+
+from config import REQUEST_TIMEOUT, get_backend_url
+
+
+def endpoint(path: str) -> str:
+    return f"{get_backend_url()}{path}"
+
+
+def media_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    if path.startswith(("http://", "https://")):
+        return path
+    return endpoint(path if path.startswith("/") else f"/{path}")
+
+
+def api_request(
+    method: str,
+    path: str,
+    *,
+    token: str | None = None,
+    **kwargs: Any,
+) -> requests.Response:
+    headers = kwargs.pop("headers", {})
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return requests.request(
+        method,
+        endpoint(path),
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        **kwargs,
+    )
+```
+
+Все API-запросы собираются через `endpoint(path)`, поэтому после настройки `BACKEND_URL` весь фронтенд автоматически начинает обращаться к `https://api.example.com`.
+
+### 2.5. Код бэкенда, который читает `CORS_ORIGINS`
+
+Файл `app/config/config.py`:
+
+```python
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ENV_FILE = PROJECT_ROOT / ".env"
+
+
+class Settings(BaseSettings):
+    app_name: str = "Asticle API"
+    app_version: str = "0.1.0"
+    debug: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8000
+    database_url: str = "sqlite:///database.db"
+    secret_key: str = "change-me"
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    cors_origins: str = (
+        "http://localhost:8501,"
+        "http://127.0.0.1:8501,"
+        "https://asticle.streamlit.app"
+    )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
+
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+`pydantic-settings` читает `.env` из корня проекта. Переменная `CORS_ORIGINS` из `.env` автоматически попадает в поле `cors_origins`, а свойство `cors_origin_list` превращает строку с запятыми в список URL.
+
+### 2.6. Код бэкенда, который подключает CORS
+
+Файл `app/main.py`:
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config.config import get_settings
+
+settings = get_settings()
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    debug=settings.debug,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+Если `CORS_ORIGINS` не содержит URL Streamlit Cloud, браузер заблокирует запросы фронтенда к API. Поэтому после создания Streamlit-приложения нужно взять его реальный URL и добавить в `.env` локального бэкенда.
+
+## 3. Локальная проверка перед деплоем
+
+### 3.1. Создать виртуальное окружение
+
+Из корня проекта:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Если команда `python3.12` недоступна, проверьте установленную версию:
+
+```bash
+python --version
+```
+
+Проект рассчитан на Python `3.12+`.
+
+На Windows активация окружения выглядит так:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 3.2. Подготовить локальный `.env`
+
+Файл `.env` не должен попадать в git. Он уже игнорируется через `.gitignore`.
+
+Минимальный пример:
+
+```env
+APP_NAME=Asticle API
+APP_VERSION=0.1.0
+DEBUG=false
+HOST=127.0.0.1
+PORT=8000
+DATABASE_URL=sqlite:///asticle.db
+SECRET_KEY=replace-with-long-random-secret
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501,https://your-app.streamlit.app
+```
+
+Замените:
+
+- `SECRET_KEY` на длинное случайное значение.
+- `DATABASE_URL`, если хотите использовать другую SQLite-базу.
+- `https://your-app.streamlit.app` на реальный URL Streamlit-приложения после создания деплоя.
+
+Для генерации `SECRET_KEY` можно использовать:
+
+```bash
+python - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+```
+или
+```bash
+openssl rand -hex 32
+```
+
+### 3.3. Запустить FastAPI локально
+
+С активированным виртуальным окружением:
+
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Проверка:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Ожидаемый смысл ответа:
+
+```json
+{
+  "status": "ok",
+  "app_name": "Asticle API",
+  "version": "0.1.0",
+  "debug": false
+}
+```
+
+### 3.4. Запустить Streamlit локально
+
+Во втором терминале активируйте то же окружение:
+
+```bash
+source .venv/bin/activate
+BACKEND_URL=http://127.0.0.1:8000 streamlit run frontend/app.py
+```
+
+На Windows:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:BACKEND_URL = "http://127.0.0.1:8000"
+streamlit run frontend/app.py
+```
+
+Откройте:
+
+```text
+http://localhost:8501
+```
+
+Проверьте регистрацию, логин, список статей, избранное, загрузку картинок.
+
+## 4. Подготовка репозитория для Streamlit Community Cloud
+
+### 4.1. Что должно быть закоммичено
+
+Обязательно:
+
+- `frontend/app.py`
+- `frontend/config.py`
+- `frontend/.streamlit/config.toml`
+- `app/`
+- `requirements.txt`
+- `README.md`
+
+Не коммитить:
+
+- `.env`
+- `.venv/`
+- `frontend/.streamlit/secrets.toml`
+
+### 4.2. Файл зависимостей
+
+`requirements.txt` должен лежать в корне репозитория.
+
+Не создавайте второй `requirements.txt` внутри `frontend/`, иначе Streamlit Cloud может взять его вместо корневого файла.
+
+Проверить локальную установку можно так:
+
+```bash
+python3.12 -m venv .venv-test
+source .venv-test/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -c "import fastapi, streamlit, sqlalchemy, requests; print('ok')"
+deactivate
+rm -rf .venv-test
+```
+
+## 5. Деплой Streamlit-фронтенда
+
+### 5.1. Создать приложение
+
+В Streamlit Community Cloud:
+
+1. Подключите GitHub-репозиторий.
+2. Выберите branch для деплоя.
+3. В поле main file path укажите:
+
+```text
+frontend/app.py
+```
+
+4. В Python version выберите версию `3.12` или новее.
+
+### 5.2. Добавить secrets
+
+В Advanced settings или в настройках уже созданного приложения добавьте:
+
+```toml
+BACKEND_URL = "https://api.example.com"
+```
+
+Где `https://api.example.com` - будущий публичный адрес FastAPI через Cloudflare Tunnel.
+
+Можно использовать и альтернативное имя:
+
+```toml
+ASTICLE_API_URL = "https://api.example.com"
+```
+
+Но лучше выбрать одно имя и дальше придерживаться его. В этом руководстве используется `BACKEND_URL`.
+
+### 5.3. Первый деплой без туннеля
+
+Если туннель ещё не настроен, Streamlit-приложение может открыться, но API-запросы будут падать. Это нормально: фронтенд уже в облаке, но публичного пути до локального FastAPI ещё нет.
+
+После создания Streamlit-приложения зафиксируйте его URL, например:
+
+```text
+https://asticle.streamlit.app
+```
+
+Этот URL нужен для `CORS_ORIGINS` в `.env` локального бэкенда.
+
+## 6. Подготовка Cloudflare Tunnel
+
+Дальше нужен домен, подключенный к Cloudflare. Пример в руководстве:
+
+```text
+api.example.com
+```
+
+Замените его на свой поддомен.
+
+### 6.1. Установить `cloudflared`
+
+На Ubuntu/Debian:
+
+```bash
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update
+sudo apt-get install cloudflared
+```
+
+Проверка:
+
+```bash
+cloudflared --version
+```
+
+### 6.2. Авторизоваться в Cloudflare
+
+```bash
+cloudflared tunnel login
+```
+
+Команда откроет браузер. Выберите домен, через который будет опубликован API.
+
+### 6.3. Создать именованный туннель
+
+```bash
+cloudflared tunnel create asticle-api
+```
+
+Запомните UUID из вывода. Он понадобится в `config.yml`.
+
+Проверка:
+
+```bash
+cloudflared tunnel list
+```
+
+### 6.4. Создать DNS route
+
+```bash
+cloudflared tunnel route dns asticle-api api.example.com
+```
+
+Эта команда создаёт DNS-запись, которая ведёт `api.example.com` в туннель.
+
+### 6.5. Создать конфиг туннеля
+
+Обычно конфиг лежит здесь:
+
+```text
+~/.cloudflared/config.yml
+```
+
+Пример:
+
+```yaml
+tunnel: <TUNNEL_UUID>
+credentials-file: /home/<USER>/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: api.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+```
+
+Замените:
+
+- `<TUNNEL_UUID>` на UUID туннеля;
+- `<USER>` на имя пользователя на локальной машине;
+- `api.example.com` на свой поддомен.
+
+Последняя строка `- service: http_status:404` обязательна для ingress-конфига: это catch-all правило для запросов, которые не совпали с предыдущими правилами.
+
+### 6.6. Проверить конфиг
+
+```bash
+cloudflared tunnel ingress validate
+cloudflared tunnel ingress rule https://api.example.com/health
+```
+
+### 6.7. Запустить туннель
+
+FastAPI уже должен быть запущен:
+
+```bash
+source .venv/bin/activate
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+В отдельном терминале запустите туннель:
+
+```bash
+cloudflared tunnel run asticle-api
+```
+
+Проверка с любой машины:
+
+```bash
+curl https://api.example.com/health
+```
+
+Если всё настроено правильно, вы получите JSON от FastAPI.
+
+## 7. Обновить CORS на локальном бэкенде
+
+Streamlit Cloud будет обращаться к API из домена вида:
+
+```text
+https://your-app.streamlit.app
+```
+
+Этот домен должен быть разрешён в `CORS_ORIGINS` локального FastAPI.
+
+Пример `.env`:
+
+```env
+CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501,https://your-app.streamlit.app
+```
+
+Если Streamlit-приложение называется `asticle`, значение может быть:
+
+```env
+CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501,https://asticle.streamlit.app
+```
+
+После изменения `.env` перезапустите FastAPI:
+
+```bash
+source .venv/bin/activate
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+## 8. Финальная настройка Streamlit secrets
+
+Когда `https://api.example.com/health` уже работает, вернитесь в Streamlit Cloud и проверьте secrets:
+
+```toml
+BACKEND_URL = "https://api.example.com"
+```
+
+Перезапустите Streamlit-приложение через Manage app -> Reboot или дождитесь redeploy.
+
+Проверьте в браузере:
+
+- открывается главная страница;
+- регистрация отправляет запрос на `https://api.example.com/auth/register`;
+- логин работает;
+- статьи загружаются;
+- картинки открываются через `https://api.example.com/media/...`;
+- избранное работает после авторизации.
+
+## 9. Быстрая диагностика
+
+### Streamlit открывается, но данных нет
+
+Проверьте secret в Streamlit:
+
+```toml
+BACKEND_URL = "https://api.example.com"
+```
+
+Проверьте API:
+
+```bash
+curl https://api.example.com/health
+```
+
+Если `curl` не отвечает, проблема в FastAPI, `cloudflared` или DNS.
+
+### `curl http://127.0.0.1:8000/health` работает, а `https://api.example.com/health` нет
+
+Проверьте туннель:
+
+```bash
+cloudflared tunnel list
+cloudflared tunnel info asticle-api
+cloudflared tunnel ingress validate
+cloudflared tunnel run asticle-api
+```
+
+Проверьте DNS route:
+
+```bash
+cloudflared tunnel route dns asticle-api api.example.com
+```
+
+### В браузере ошибка CORS
+
+В `.env` локального FastAPI должен быть точный URL Streamlit-приложения:
+
+```env
+CORS_ORIGINS=https://your-app.streamlit.app
+```
+
+Если нужны несколько origins, перечисляйте через запятую:
+
+```env
+CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501,https://your-app.streamlit.app
+```
+
+После изменения `.env` перезапустите FastAPI.
+
+### Streamlit Cloud не ставит зависимости
+
+Проверьте:
+
+- `requirements.txt` закоммичен в корне репозитория;
+- в настройках Streamlit выбран Python `3.12+`;
+- рядом с `frontend/app.py` нет второго файла зависимостей, который перекрывает корневой `requirements.txt`.
+
+### API работает локально, но пользователи видят старые данные
+
+Так как база SQLite локальная, Streamlit Cloud не хранит и не синхронизирует её. Все данные живут там, где запущен FastAPI. Проверьте:
+
+- какой `DATABASE_URL` указан в `.env`;
+- из какой директории запущен FastAPI;
+- есть ли права на файл `.db`;
+- не запущено ли две копии API с разными базами.
+
+### Картинки не отображаются
+
+FastAPI отдаёт `media/` через endpoint `/media`.
+
+Проверьте:
+
+```bash
+curl -I https://api.example.com/media/<filename>.png
+```
+
+Если локально файл есть, но через туннель он не открывается, проверьте:
+
+- что FastAPI запущен из корректного проекта;
+- что `media/` существует;
+- что у пользователя, который запустил FastAPI, есть права на чтение файлов;
+- что URL в базе не указывает на старый hostname.
+
+## 10. Чеклист перед финальным деплоем
+
+- [ ] `python3.12 -m venv .venv` создаёт виртуальное окружение.
+- [ ] `pip install -r requirements.txt` проходит локально.
+- [ ] `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` запускает API.
+- [ ] `curl http://127.0.0.1:8000/health` возвращает `status: ok`.
+- [ ] `BACKEND_URL=http://127.0.0.1:8000 streamlit run frontend/app.py` работает локально.
+- [ ] `requirements.txt` закоммичен в корне репозитория.
+- [ ] В Streamlit Cloud entrypoint указан как `frontend/app.py`.
+- [ ] В Streamlit Cloud выбран Python `3.12+`.
+- [ ] В Streamlit secrets задан `BACKEND_URL = "https://api.example.com"`.
+- [ ] Cloudflare Tunnel создан и имеет DNS route на `api.example.com`.
+- [ ] `curl https://api.example.com/health` работает извне.
+- [ ] В `.env` FastAPI указан `CORS_ORIGINS` с реальным URL Streamlit-приложения.
+- [ ] FastAPI и `cloudflared` запущены вручную перед демонстрацией.
+
+## 11. Полезные ссылки
+
+- Streamlit Community Cloud: зависимости приложения: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies
+- Streamlit Community Cloud: secrets: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management
+- Cloudflare Tunnel: локально управляемый tunnel: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/create-local-tunnel/
+- Cloudflare Tunnel: configuration file: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/
